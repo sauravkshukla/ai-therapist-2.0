@@ -1,119 +1,142 @@
-from langchain.agents import tool
-from tools import query_medgemma, call_emergency
-
-@tool
-def ask_mental_health_specialist(query: str) -> str:
-    """
-    Generate a therapeutic response using the MedGemma model.
-    Use this for all general user queries, mental health questions, emotional concerns,
-    or to offer empathetic, evidence-based guidance in a conversational tone.
-    """
-    return query_medgemma(query)
-
-
-@tool
-def emergency_call_tool() -> None:
-    """
-    Place an emergency call to the safety helpline's phone number via Twilio.
-    Use this only if the user expresses suicidal ideation, intent to self-harm,
-    or describes a mental health emergency requiring immediate help.
-    """
-    call_emergency()
-
-
-
+from langchain.tools import tool
+from langgraph.prebuilt import create_react_agent
+from langchain_groq import ChatGroq
 import googlemaps
-from config import GOOGLE_MAPS_API_KEY
-gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
 
+from .tools import call_emergency, query_medgemma
+from .config import GROQ_API_KEY, GOOGLE_MAPS_API_KEY
+
+
+# ==============================
+# TOOL 1: Mental Health Specialist
+# ==============================
+@tool
+def ask_mental_health_specialist(user_message: str) -> str:
+    """
+    Use this tool to respond to emotional or psychological concerns
+    with therapeutic guidance.
+    """
+    return query_medgemma(user_message)
+
+
+# ==============================
+# TOOL 2: Emergency Call
+# ==============================
+@tool
+def emergency_call_tool(user_message: str) -> str:
+    """
+    Place an emergency call if user expresses suicidal intent
+    or self-harm thoughts.
+    """
+    call_emergency(user_message)
+    return "Emergency contact has been notified."
+
+
+# ==============================
+# TOOL 3: Find Nearby Therapists
+# ==============================
+gmaps = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
 
 @tool
 def find_nearby_therapists_by_location(location: str) -> str:
     """
-    Finds real therapists near the specified location using Google Maps API.
-    
-    Args:
-        location (str): The city or area to search.
-    
-    Returns:
-        str: A list of therapist names, addresses, and phone numbers.
+    Finds real therapists near the specified location.
     """
+
     geocode_result = gmaps.geocode(location)
+    if not geocode_result:
+        return "Could not find the specified location."
+
     lat_lng = geocode_result[0]['geometry']['location']
     lat, lng = lat_lng['lat'], lat_lng['lng']
+
     places_result = gmaps.places_nearby(
-            location=(lat, lng),
-            radius=5000,
-            keyword="Psychotherapist"
-        )
+        location=(lat, lng),
+        radius=5000,
+        keyword="Psychotherapist"
+    )
+
+    if not places_result.get("results"):
+        return "No therapists found nearby."
+
     output = [f"Therapists near {location}:"]
     top_results = places_result['results'][:5]
+
     for place in top_results:
-            name = place.get("name", "Unknown")
-            address = place.get("vicinity", "Address not available")
-            details = gmaps.place(place_id=place["place_id"], fields=["formatted_phone_number"])
-            phone = details.get("result", {}).get("formatted_phone_number", "Phone not available")
+        name = place.get("name", "Unknown")
+        address = place.get("vicinity", "Address not available")
 
-            output.append(f"- {name} | {address} | {phone}")
+        details = gmaps.place(
+            place_id=place["place_id"],
+            fields=["formatted_phone_number"]
+        )
 
-    
+        phone = details.get("result", {}).get(
+            "formatted_phone_number",
+            "Phone not available"
+        )
+
+        output.append(f"- {name} | {address} | {phone}")
+
     return "\n".join(output)
 
 
-# Step1: Create an AI Agent & Link to backend
-#from langchain_openai import ChatOpenAI
-from langchain_groq import ChatGroq
-from langgraph.prebuilt import create_react_agent
-from config import GROQ_API_KEY
+# ==============================
+# LLM SETUP
+# ==============================
+tools = [
+    ask_mental_health_specialist,
+    emergency_call_tool,
+    find_nearby_therapists_by_location
+]
 
-tools = [ask_mental_health_specialist, emergency_call_tool, find_nearby_therapists_by_location]
-#llm = ChatOpenAI(model="gpt-4", temperature=0.2, api_key=OPENAI_API_KEY)
-llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.2, api_key=GROQ_API_KEY)
+llm = ChatGroq(
+    model="openai/gpt-oss-120b",
+    temperature=0.2,
+    api_key=GROQ_API_KEY
+)
+
 graph = create_react_agent(llm, tools=tools)
 
+
+# ==============================
+# SYSTEM PROMPT
+# ==============================
 SYSTEM_PROMPT = """
-You are an AI engine supporting mental health conversations with warmth and vigilance.
+You are an AI engine supporting mental health conversations
+with warmth and vigilance.
+
 You have access to three tools:
 
-1. `ask_mental_health_specialist`: Use this tool to answer all emotional or psychological queries with therapeutic guidance.
-2. `locate_therapist_tool`: Use this tool if the user asks about nearby therapists or if recommending local professional help would be beneficial.
-3. `emergency_call_tool`: Use this immediately if the user expresses suicidal thoughts, self-harm intentions, or is in crisis.
+1. ask_mental_health_specialist → Use for emotional support.
+2. find_nearby_therapists_by_location → Use if user wants nearby therapists.
+3. emergency_call_tool → Use immediately if user expresses suicidal intent.
 
-Always take necessary action. Respond kindly, clearly, and supportively.
+Always respond kindly and supportively.
 """
 
+
+# ==============================
+# RESPONSE PARSER
+# ==============================
 def parse_response(stream):
     tool_called_name = "None"
     final_response = None
 
     for s in stream:
-        # Check if a tool was called
         tool_data = s.get('tools')
         if tool_data:
             tool_messages = tool_data.get('messages')
-            if tool_messages and isinstance(tool_messages, list):
+            if tool_messages:
                 for msg in tool_messages:
                     tool_called_name = getattr(msg, 'name', 'None')
 
-        # Check if agent returned a message
         agent_data = s.get('agent')
         if agent_data:
             messages = agent_data.get('messages')
-            if messages and isinstance(messages, list):
+            if messages:
                 for msg in messages:
                     if msg.content:
                         final_response = msg.content
 
     return tool_called_name, final_response
-
-
-"""if __name__ == "__main__":
-    while True:
-        user_input = input("User: ")
-        print(f"Received user input: {user_input[:200]}...")
-        inputs = {"messages": [("system", SYSTEM_PROMPT), ("user", user_input)]}
-        stream = graph.stream(inputs, stream_mode="updates")
-        tool_called_name, final_response = parse_response(stream)
-        print("TOOL CALLED: ", tool_called_name)
-        print("ANSWER: ", final_response)"""
-        
